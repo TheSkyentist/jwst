@@ -148,6 +148,7 @@ class CleanFlickerNoiseStep(Step):
                         "Using default background method (median)."
                     )
                     self.background_method = "median"
+                    background_filename = None
 
             result = clean_flicker_noise.do_correction(
                 input_model,
