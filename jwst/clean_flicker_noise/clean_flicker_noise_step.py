@@ -28,12 +28,17 @@ class CleanFlickerNoiseStep(Step):
     fit_by_channel : bool, optional
         If set, flicker noise is fit independently for each detector channel.
         Ignored for MIRI, for subarray data, and for `fit_method` = 'fft'
-    background_method : {'median', 'model', None}
+    background_method : {'median', 'model', 'wfssbkg', None}
         If 'median', the preliminary background to remove and restore
         is a simple median of the background data.  If 'model', the
         background data is fit with a low-resolution model via
         `~photutils.background.Background2D`.  If None, the background
         value is 0.0.
+    override_bkg : str or None, optional
+        Path to a user-supplied background model.  If None, the
+        background model is derived from the input data.  This
+        parameter is only used if `background_method` = 'model'.  The
+        model must be a 2D image with the same shape as the input.
     background_box_size : tuple of int or None, optional
         Box size for the data grid used by `Background2D` when
         `background_method` = 'model'. For best results, use a box size
@@ -53,6 +58,10 @@ class CleanFlickerNoiseStep(Step):
         generated override flat is required to enable this option.
         Use the `override_flat` parameter to provide an alternate flat image
         as needed.
+    override_flat : str or None, optional
+        Path to a user-supplied flat field image.  If None, the
+        calibration reference file is used. This parameter is only
+        used if `apply_flat_field` = True.
     n_sigma : float, optional
         Sigma clipping threshold to be used in detecting outliers in the image.
     fit_histogram : bool, optional
@@ -78,10 +87,12 @@ class CleanFlickerNoiseStep(Step):
     spec = """
         fit_method = option('fft', 'median', default='median')  # Noise fitting algorithm
         fit_by_channel = boolean(default=False)  # Fit noise separately by amplifier (NIR only)
-        background_method = option('median', 'model', None, default='median') # Background fit
+        background_method = option('median', 'model', 'wfssbkg', None, default='median') # Background fit
+        override_bkg = string(default=None)
         background_box_size = int_list(min=2, max=2, default=None)  # Background box size
         mask_science_regions = boolean(default=False)  # Mask known science regions
         apply_flat_field = boolean(default=False)  # Apply a flat correction before fitting
+        override_flat = string(default=None)  # Path to user-supplied flat
         n_sigma = float(default=2.0)  # Clipping level for non-background signal
         fit_histogram = boolean(default=False)  # Fit a value histogram to derive sigma
         single_mask = boolean(default=True)  # Make a single mask for all integrations
@@ -92,7 +103,7 @@ class CleanFlickerNoiseStep(Step):
         skip = boolean(default=True)  # By default, skip the step
     """  # noqa: E501
 
-    reference_file_types = ["flat"]
+    reference_file_types = ["flat", "wfssbkg"]
 
     def process(self, input_data):
         """
@@ -110,19 +121,33 @@ class CleanFlickerNoiseStep(Step):
         """
         # Open the input data model
         with datamodels.open(input_data) as input_model:
+            # Find the relevant flat-field reference or user-supplied flat
             flat_filename = None
             if self.apply_flat_field:
-                flat_filename = self.get_reference_file(input_model, "flat")
-                exp_type = input_model.meta.exposure.type
+                flat_filename = self.override_flat or self.get_reference_file(input_model, "flat")
                 if flat_filename == "N/A":
+                    flat_filename = None
+                    exp_type = input_model.meta.exposure.type
                     self.log.warning(
                         f"Flat correction is not available for "
                         f"exposure type {exp_type} without a user-"
                         f"supplied flat."
                     )
-                    flat_filename = None
                 else:
                     self.log.info(f"Using FLAT reference file: {flat_filename}")
+
+            # Find the relevant background reference or user-supplied background
+            background_filename = None
+            if self.background_method == "model" and self.override_bkg:
+                background_filename = self.override_bkg
+            elif self.background_method == "wfssbkg":
+                background_filename = self.get_reference_file(input_model, "wfssbkg")
+                if background_filename == "N/A":
+                    self.log.warning(
+                        "WFSS background reference file not found. "
+                        "Using default background method (median)."
+                    )
+                    self.background_method = "median"
 
             result = clean_flicker_noise.do_correction(
                 input_model,
@@ -130,6 +155,7 @@ class CleanFlickerNoiseStep(Step):
                 fit_method=self.fit_method,
                 fit_by_channel=self.fit_by_channel,
                 background_method=self.background_method,
+                background_filename=background_filename,
                 background_box_size=self.background_box_size,
                 mask_science_regions=self.mask_science_regions,
                 flat_filename=flat_filename,

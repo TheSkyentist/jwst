@@ -4,6 +4,7 @@ import warnings
 import gwcs
 from gwcs.utils import _toindex
 import numpy as np
+from astropy.modeling import fitting, models
 from astropy.stats import sigma_clipped_stats, SigmaClip
 from astropy.utils.exceptions import AstropyUserWarning
 from photutils.background import Background2D, MedianBackground
@@ -242,6 +243,7 @@ def clip_to_background(
     mask,
     sigma_lower=3.0,
     sigma_upper=2.0,
+    background_image=None,
     fit_histogram=False,
     lower_half_only=False,
     verbose=False,
@@ -284,6 +286,9 @@ def clip_to_background(
         for the clipping limit. Values above this limit are marked
         False in the mask.
 
+    background_image : array-like of float, optional
+        The background image to use for the background fit.
+
     fit_histogram :  bool, optional
         If set, the center value and standard deviation used with
         `sigma_lower` and `sigma_upper` for clipping outliers is derived
@@ -311,6 +316,14 @@ def clip_to_background(
 
     # Check mask for any valid data before proceeding
     if not np.any(mask):
+        return
+
+    # If background image is provided, use it to make the mask
+    if background_image is not None:
+        sigma_clip_for_bkg = SigmaClip(sigma=sigma_limit, maxiters=5)
+        fitter = fitting.FittingWithOutlierRemoval(fitting.LinearLSQFitter(), sigma_clip_for_bkg)
+        _, outliers = fitter(models.Linear1D(), background_image[mask], image[mask])
+        mask[mask] = np.invert(outliers)
         return
 
     # Initial iterative sigma clip
@@ -412,7 +425,12 @@ def clip_to_background(
 
 
 def create_mask(
-    input_model, mask_science_regions=False, n_sigma=2.0, fit_histogram=False, single_mask=False
+    input_model,
+    mask_science_regions=False,
+    background_image=None,
+    n_sigma=2.0,
+    fit_histogram=False,
+    single_mask=False,
 ):
     """
     Create a mask identifying background pixels.
@@ -432,6 +450,9 @@ def create_mask(
         For MIRI imaging, mask regions of the detector not used for science.
         This requires that DO_NOT_USE flags are set in the DQ array
         for the input_model.
+
+    background_image : `~jwst.datamodel.JwstDataModel`, optional
+        Background image to use for the background fit.
 
     n_sigma : float, optional
         Sigma threshold for masking outliers.
@@ -513,12 +534,18 @@ def create_mask(
                 input_model.data[i],
                 mask[i],
                 sigma_upper=n_sigma,
+                background_image=background_image,
                 fit_histogram=fit_histogram,
                 verbose=True,
             )
     else:
         clip_to_background(
-            input_model.data, mask, sigma_upper=n_sigma, fit_histogram=fit_histogram, verbose=True
+            input_model.data,
+            mask,
+            sigma_upper=n_sigma,
+            background_image=background_image,
+            fit_histogram=fit_histogram,
+            verbose=True,
         )
 
     # Reduce the mask to a single plane if needed
@@ -529,7 +556,9 @@ def create_mask(
     return mask
 
 
-def background_level(image, mask, background_method="median", background_box_size=None):
+def background_level(
+    image, mask, background_method="median", background_image=None, background_box_size=None
+):
     """
     Fit a low-resolution background level.
 
@@ -542,12 +571,17 @@ def background_level(image, mask, background_method="median", background_box_siz
         The mask that indicates which pixels are to be used in fitting.
         True indicates a background pixel.
 
-    background_method : {'median', 'model', None}, optional
+    background_method : {'median', 'model',  None}, optional
         If 'median', the preliminary background to remove and restore
         is a simple median of the background data.  If 'model', the
         background data is fit with a low-resolution model via
         `~photutils.background.Background2D`.  If None, the background
         value is 0.0.
+
+    background_image : array-like of float, optional
+        The background image to use for the background fit.  This
+        parameter may be only used if `background_method` = 'model'
+        or 'wfssbkg'.
 
     background_box_size : tuple of int, optional
         Box size for the data grid used by `Background2D` when
@@ -575,46 +609,66 @@ def background_level(image, mask, background_method="median", background_box_siz
             image, mask, sigma_lower=sigma_limit, sigma_upper=sigma_limit, lower_half_only=True
         )
 
-        if background_method == "model":
+        if background_method in ["model", "wfssbkg"]:
             sigma_clip_for_bkg = SigmaClip(sigma=sigma_limit, maxiters=5)
-            bkg_estimator = MedianBackground()
 
-            if background_box_size is None:
-                # use 32 x 32 if possible, otherwise take next largest box
-                # size that evenly divides the image (minimum 1)
-                background_box_size = []
-                recommended = np.arange(1, 33)
-                for i_size in image.shape:
-                    divides_evenly = i_size % recommended == 0
-                    background_box_size.append(int(recommended[divides_evenly][-1]))
-                log.debug(f"Using box size {background_box_size}")
+            if background_image is None:
+                bkg_estimator = MedianBackground()
 
-            box_division_remainder = (
-                image.shape[0] % background_box_size[0],
-                image.shape[1] % background_box_size[1],
-            )
-            if not np.allclose(box_division_remainder, 0):
-                log.warning(
-                    f"Background box size {background_box_size} "
-                    f"does not divide evenly into the image "
-                    f"shape {image.shape}."
+                if background_box_size is None:
+                    # use 32 x 32 if possible, otherwise take next largest box
+                    # size that evenly divides the image (minimum 1)
+                    background_box_size = []
+                    recommended = np.arange(1, 33)
+                    for i_size in image.shape:
+                        divides_evenly = i_size % recommended == 0
+                        background_box_size.append(int(recommended[divides_evenly][-1]))
+                    log.debug(f"Using box size {background_box_size}")
+
+                box_division_remainder = (
+                    image.shape[0] % background_box_size[0],
+                    image.shape[1] % background_box_size[1],
+                )
+                if not np.allclose(box_division_remainder, 0):
+                    log.warning(
+                        f"Background box size {background_box_size} "
+                        f"does not divide evenly into the image "
+                        f"shape {image.shape}."
+                    )
+
+                try:
+                    with warnings.catch_warnings():
+                        warnings.filterwarnings(action="ignore", category=AstropyUserWarning)
+                        bkg = Background2D(
+                            image,
+                            box_size=background_box_size,
+                            filter_size=(5, 5),
+                            mask=~mask,
+                            sigma_clip=sigma_clip_for_bkg,
+                            bkg_estimator=bkg_estimator,
+                        )
+                    background = bkg.background
+                except ValueError:
+                    log.error("Background fit failed, using median value.")
+                    background = np.nanmedian(image[mask])
+
+            else:
+                fitter = fitting.FittingWithOutlierRemoval(
+                    fitting.LinearLSQFitter(), sigma_clip_for_bkg
                 )
 
-            try:
-                with warnings.catch_warnings():
-                    warnings.filterwarnings(action="ignore", category=AstropyUserWarning)
-                    bkg = Background2D(
-                        image,
-                        box_size=background_box_size,
-                        filter_size=(5, 5),
-                        mask=~mask,
-                        sigma_clip=sigma_clip_for_bkg,
-                        bkg_estimator=bkg_estimator,
-                    )
-                background = bkg.background
-            except ValueError:
-                log.error("Background fit failed, using median value.")
-                background = np.nanmedian(image[mask])
+                try:
+                    with warnings.catch_warnings():
+                        warnings.filterwarnings(action="ignore", category=AstropyUserWarning)
+                        scale_fit, outliers = fitter(
+                            models.Linear1D(), background_image[mask], image[mask]
+                        )
+                        background = scale_fit.slope.value * background_image
+
+                except ValueError:
+                    log.error("Background fit failed, using median value.")
+                    background = np.nanmedian(image[mask])
+
         else:
             background = np.nanmedian(image[mask])
     return background
@@ -907,7 +961,7 @@ def median_clean(image, mask, axis_to_correct, fit_by_channel=False):
     return corrected_image
 
 
-def _check_input(exp_type, fit_method):
+def _check_input(exp_type, fit_method, bkg_method):
     """
     Check for valid input data and options.
 
@@ -917,6 +971,8 @@ def _check_input(exp_type, fit_method):
         Exposure type for the input.
     fit_method : str
         Noise fitting method.
+    bkg_method : str
+        Background fitting method.
 
     Returns
     -------
@@ -932,6 +988,10 @@ def _check_input(exp_type, fit_method):
     if fit_method == "fft":
         if exp_type not in nsclean_allowed:
             message = f"Fit method 'fft' cannot be applied to exp_type {exp_type}"
+
+    if bkg_method == "wfssbkg" and not exp_type.endswith("WFSS"):
+        message = f"Background method 'wfssbkg' cannot be applied to exp_type {exp_type}"
+        return False
 
     if message is not None:
         log.warning(message)
@@ -1038,59 +1098,69 @@ def _standardize_parameters(exp_type, subarray, slowaxis, background_method, fit
     return axis_to_correct, background_method, fit_by_channel, fc
 
 
-def _read_flat_file(input_model, flat_filename):
+def _read_image_file(input_model, image_filename, imtype):
     """
-    Read flat data from an input file path.
+    Read image data from an input file path.
 
-    Flat data is assumed to be full frame.  Subarrays matching the input
+    Image data is assumed to be full frame.  Subarrays matching the input
     data are extracted as needed.
 
-    Only the flat image is returned: error and DQ arrays are ignored.
-    Any zeros or NaNs in the flat image are set to a smoothed local average
+    Only the image image is returned: error and DQ arrays are ignored.
+    Any zeros or NaNs in the image are set to a smoothed local average
     value (via `background_level`, with background_method = 'model') before
     returning, to avoid impacting the background and noise fits near
-    missing flat data.
+    missing image data.
 
     Parameters
     ----------
     input_model : `~jwst.datamodel.JwstDataModel`
         The input data.
-    flat_filename : str
-        File path for a full-frame flat image.
+    filename : str
+        File path for a full-frame image.
+    imtype : str
+        The type of image data to be read.  This is used to
+        determine the appropriate datamodel class to use.
+        Currently, this is either 'flat' or 'wfssbkg'.
 
     Returns
     -------
-    flat_data : array-like of float
-        A 2D flat image array matching the input data.
+    image_data : array-like of float
+        A 2D image array matching the input data.
     """
-    if flat_filename is None:
+    if image_filename is None:
         return None
 
-    # Open the provided flat as FlatModel
+    # Open the provided image as relevant DataModel
     log.debug("Dividing by flat data prior to fitting")
-    flat = datamodels.FlatModel(flat_filename)
+    match imtype:
+        case "flat":
+            image = datamodels.FlatModel(image_filename)
+        case "wfssbkg":
+            image = datamodels.open(image_filename)
+        case _:
+            raise ValueError(f"Unsupported image type: {imtype}")
 
     # Extract subarray from reference data, if necessary
-    if ref_matches_sci(input_model, flat):
-        flat_data = flat.data
+    if ref_matches_sci(input_model, image):
+        image_data = image.data
     else:
         log.debug("Extracting matching subarray from flat")
-        sub_flat = get_subarray_model(input_model, flat)
-        flat_data = sub_flat.data
-        sub_flat.close()
-    flat.close()
+        sub_image = get_subarray_model(input_model, image)
+        image_data = sub_image.data
+        sub_image.close()
+    image.close()
 
-    # Set any zeros or non-finite values in the flat data to a smoothed local value
-    bad_data = (flat_data == 0) | ~np.isfinite(flat_data)
+    # Set any zeros or non-finite values in the image data to a smoothed local value
+    bad_data = (image_data == 0) | ~np.isfinite(image_data)
     if np.any(bad_data):
-        smoothed_flat = background_level(flat_data, ~bad_data, background_method="model")
+        smoothed_image = background_level(image_data, ~bad_data, background_method="model")
         try:
-            flat_data[bad_data] = smoothed_flat[bad_data]
+            image_data[bad_data] = smoothed_image[bad_data]
         except IndexError:
             # 2D model failed, median value returned instead
-            flat_data[bad_data] = smoothed_flat
+            image_data[bad_data] = smoothed_image
 
-    return flat_data
+    return image_data
 
 
 def _make_processed_rate_image(
@@ -1158,7 +1228,14 @@ def _make_processed_rate_image(
 
 
 def _make_scene_mask(
-    user_mask, image_model, mask_science_regions, n_sigma, fit_histogram, single_mask, save_mask
+    user_mask,
+    image_model,
+    mask_science_regions,
+    background_image,
+    n_sigma,
+    fit_histogram,
+    single_mask,
+    save_mask,
 ):
     """
     Make a scene mask from user input or rate image.
@@ -1178,6 +1255,8 @@ def _make_scene_mask(
         boxes for slits/slices, as well as any regions known to be
         affected by failed-open MSA shutters.  For MIRI imaging, mask
         regions of the detector not used for science.
+    background_image : array-like of float or None
+        If not None, the background image to be used for scene masking.
     n_sigma : float
         N-sigma rejection level for finding outliers.
     fit_histogram : bool
@@ -1216,6 +1295,7 @@ def _make_scene_mask(
         background_mask = create_mask(
             image_model,
             mask_science_regions=mask_science_regions,
+            background_image=background_image,
             n_sigma=n_sigma,
             fit_histogram=fit_histogram,
             single_mask=single_mask,
@@ -1289,6 +1369,7 @@ def _clean_one_image(
     image,
     mask,
     background_method,
+    background_image,
     background_box_size,
     n_sigma,
     fit_method,
@@ -1310,6 +1391,9 @@ def _clean_one_image(
         marked as True.
     background_method : str
         The method for fitting the background.
+    background_image : array-like of float or None
+        If not none, the background image to be used for
+        background_method = 'model' or 'wfssbkg'.
     background_box_size : tuple of int
         Background box size, used with `background_method`
         is 'model'.
@@ -1371,6 +1455,7 @@ def _clean_one_image(
             image,
             mask,
             background_method=background_method,
+            background_image=background_image,
             background_box_size=background_box_size,
         )
         log.debug(f"Background level: {np.nanmedian(background):.5g}")
@@ -1434,6 +1519,7 @@ def do_correction(
     fit_method="median",
     fit_by_channel=False,
     background_method="median",
+    background_filename=None,
     background_box_size=None,
     mask_science_regions=False,
     flat_filename=None,
@@ -1464,12 +1550,17 @@ def do_correction(
         If set, flicker noise is fit independently for each detector channel.
         Ignored for MIRI, for subarray data, and for `fit_method` = 'fft'.
 
-    background_method : {'median', 'model', None}, optional
+    background_method : {'median', 'model', 'wfssbkg', None}, optional
         If 'median', the preliminary background to remove and restore
         is a simple median of the background data.  If 'model', the
         background data is fit with a low-resolution model via
-        `~photutils.background.Background2D`.  If None, the background
-        value is 0.0.
+        `~photutils.background.Background2D`.  If 'wfssbkg', uses
+        the WFSSBkg calibration if applicable.  If None, the
+        background value is 0.0.
+
+    background_filename : str or None, optional
+        Path to background data to use for the background fit.
+        If None, the background is fit from the input data.
 
     background_box_size : tuple of int, optional
         Box size for the data grid used by `Background2D` when
@@ -1540,7 +1631,7 @@ def do_correction(
     log.info(f"Input exposure type is {exp_type}, detector={detector}")
 
     # Check for a valid input that we can work on
-    if not _check_input(exp_type, fit_method):
+    if not _check_input(exp_type, fit_method, background_method):
         return input_model, None, None, None, status
 
     output_model = input_model.copy()
@@ -1552,7 +1643,10 @@ def do_correction(
     )
 
     # Read the flat file, if provided
-    flat = _read_flat_file(input_model, flat_filename)
+    flat = _read_image_file(input_model, flat_filename, "flat")
+
+    # Read the background image, if provided
+    background_image = _read_image_file(input_model, background_filename, "wfssbkg")
 
     # Make a rate file if needed
     if user_mask is None:
@@ -1564,7 +1658,14 @@ def do_correction(
 
     # Make a mask model from the user input or the rate data
     background_mask, mask_model = _make_scene_mask(
-        user_mask, image_model, mask_science_regions, n_sigma, fit_histogram, single_mask, save_mask
+        user_mask,
+        image_model,
+        mask_science_regions,
+        background_image,
+        n_sigma,
+        fit_histogram,
+        single_mask,
+        save_mask,
     )
 
     log.info(f"Cleaning image {input_model.meta.filename}")
@@ -1616,6 +1717,7 @@ def do_correction(
                 image,
                 mask,
                 background_method,
+                background_image,
                 background_box_size,
                 n_sigma,
                 fit_method,
