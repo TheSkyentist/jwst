@@ -571,11 +571,13 @@ def background_level(
         The mask that indicates which pixels are to be used in fitting.
         True indicates a background pixel.
 
-    background_method : {'median', 'model',  None}, optional
+    background_method : {'median', 'model', 'wfssbkg', None}, optional
         If 'median', the preliminary background to remove and restore
         is a simple median of the background data.  If 'model', the
         background data is fit with a low-resolution model via
-        `~photutils.background.Background2D`.  If None, the background
+        `~photutils.background.Background2D`.
+        If 'wfssbkg', the background is fit using the WFSS background calibration.
+        If None, the background
         value is 0.0.
 
     background_image : array-like of float, optional
